@@ -40,15 +40,9 @@ class ExportSummary:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description='Export reverse-engineering context for AI with pyghidra.'
-    )
+    parser = argparse.ArgumentParser(description='Export reverse-engineering context for AI with pyghidra.')
     parser.add_argument('binary', help='Path to the executable or library file to analyze.')
-    parser.add_argument(
-        'export_dir',
-        nargs='?',
-        help='Optional export directory path. Defaults to <binary_name>_ghidra_export.',
-    )
+    parser.add_argument('export_dir', nargs='?', help='Optional export directory path. Defaults to <binary_name>_ghidra_export.')
     return parser
 
 
@@ -58,23 +52,16 @@ def resolve_export_dir(binary_path: Path, export_dir_arg: str | None) -> Path:
     return Path(export_dir_arg).expanduser().resolve()
 
 
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('w', encoding='utf-8', newline='\n') as handle:
         handle.write(content)
 
 
+def ensure_dir(path: Path) -> None: path.mkdir(parents=True, exist_ok=True)
+
+
 def iter_java_iterator(iterator) -> Iterable:
-    while iterator.hasNext():
-        yield iterator.next()
-
-
-def iter_java_collection(collection) -> Iterable:
-    iterator = collection.iterator()
     while iterator.hasNext():
         yield iterator.next()
 
@@ -83,10 +70,7 @@ def to_address(program, offset: int):
     return program.getAddressFactory().getDefaultAddressSpace().getAddress(offset)
 
 
-def address_offset(address) -> int:
-    return int(address.getOffset())
-
-
+def address_offset(address) -> int: return int(address.getOffset())
 def safe_text(value) -> str:
     if value is None:
         return ''
@@ -94,19 +78,13 @@ def safe_text(value) -> str:
     return text[:77] + '...' if len(text) > 80 else text
 
 
-def format_address_list(addresses: list[int]) -> str:
-    return 'none' if not addresses else ', '.join(hex(address) for address in addresses)
-
-
+def format_address_list(addresses: list[int]) -> str: return 'none' if not addresses else ', '.join(hex(address) for address in addresses)
 def make_project_name(binary_path: Path) -> str:
     stem = ''.join(ch if ch.isalnum() else '_' for ch in binary_path.stem)
     return f'{stem}_{os.getpid()}_{int(time.time())}'
 
 
-def block_name_lower(name: str | None) -> str:
-    return '' if not name else name.lower()
-
-
+def block_name_lower(name: str | None) -> str: return '' if not name else name.lower()
 def should_export_block_name(name: str | None) -> bool:
     lower_name = block_name_lower(name)
     if not lower_name:
@@ -146,24 +124,21 @@ def function_entry_offset(function) -> int:
     return address_offset(function.getEntryPoint())
 
 
-def is_library_like_function(function) -> bool:
-    if function.isExternal():
-        return True
+def get_thunked_external_function(function):
     try:
-        if function.isThunk():
-            thunked = function.getThunkedFunction(True)
-            if thunked is not None and thunked.isExternal():
-                return True
+        thunked = function.getThunkedFunction(True) if function.isThunk() else None
+        if thunked is not None and thunked.isExternal():
+            return thunked
     except Exception:
         pass
-    return False
+    return None
 
 
 def get_callers(function) -> list[int]:
     monitor = pyghidra.task_monitor()
     callers = set()
     try:
-        for caller in iter_java_collection(function.getCallingFunctions(monitor)):
+        for caller in iter_java_iterator(function.getCallingFunctions(monitor).iterator()):
             if caller is None or caller.isExternal():
                 continue
             callers.add(function_entry_offset(caller))
@@ -176,13 +151,121 @@ def get_callees(function) -> list[int]:
     monitor = pyghidra.task_monitor()
     callees = set()
     try:
-        for callee in iter_java_collection(function.getCalledFunctions(monitor)):
+        for callee in iter_java_iterator(function.getCalledFunctions(monitor).iterator()):
             if callee is None or callee.isExternal():
                 continue
             callees.add(function_entry_offset(callee))
     except Exception:
         return []
     return sorted(callees)
+
+
+def get_callers_for_address(program, entry_offset: int) -> list[int]:
+    reference_manager = program.getReferenceManager()
+    callers = set()
+    for reference in reference_manager.getReferencesTo(to_address(program, entry_offset)):
+        function = program.getFunctionManager().getFunctionContaining(reference.getFromAddress())
+        if function is not None and not function.isExternal():
+            callers.add(function_entry_offset(function))
+    return sorted(callers)
+
+
+def get_external_function_from_pointer(program, pointer_address):
+    for reference in program.getReferenceManager().getReferencesFrom(pointer_address):
+        function = program.getFunctionManager().getFunctionAt(reference.getToAddress())
+        if function is not None and function.isExternal():
+            return function
+    return None
+
+
+def get_import_symbol_name(program, entry_address) -> str | None:
+    instruction = program.getListing().getInstructionAt(entry_address)
+    if instruction is None:
+        return None
+    for reference in instruction.getReferencesFrom():
+        if reference.getToAddress().getAddressSpace().isExternalSpace():
+            continue
+        symbol = program.getSymbolTable().getPrimarySymbol(reference.getToAddress())
+        if symbol is not None and symbol.getName(True).startswith('__imp_'):
+            return symbol.getName(True)
+    return None
+
+
+def build_thunk_source(external_function, import_symbol_name: str) -> str:
+    signature = external_function.getPrototypeString(True, True)
+    args = ', '.join(parameter.getName() for parameter in external_function.getParameters())
+    call = f'{import_symbol_name}({args})'
+    body = f'  {call};' if external_function.getReturnType().getName() == 'void' else f'  return {call};'
+    return '\n'.join(['// attributes: thunk', signature, '{', body, '}'])
+
+
+def write_issue_report(path: Path, title: str, items: list[tuple[int, str, str]]) -> None:
+    if not items:
+        path.unlink(missing_ok=True)
+        return
+    lines = [title, '# Format: address | function_name | reason', '#' + '=' * 80, '']
+    lines.extend(f'{hex(addr)} | {name} | {reason}' for addr, name, reason in items)
+    write_text(path, '\n'.join(lines) + '\n')
+
+
+def write_function_output(path: Path, name: str, address: int, callers: list[int], callees: list[int], code: str) -> None:
+    write_text(
+        path,
+        '\n'.join([
+            '/*',
+            f' * func-name: {name}',
+            f' * func-address: {hex(address)}',
+            f' * callers: {format_address_list(callers)}',
+            f' * callees: {format_address_list(callees)}',
+            ' */',
+            '',
+            code,
+            '',
+        ]),
+    )
+
+
+def collect_missing_import_thunks(program, known_entries: set[int]) -> list[dict[str, object]]:
+    pointer_size = program.getDefaultPointerSize()
+    if pointer_size not in (4, 8):
+        return []
+    function_manager = program.getFunctionManager()
+    symbol_table = program.getSymbolTable()
+    records: list[dict[str, object]] = []
+    for block in program.getMemory().getBlocks():
+        if not block.isExecute() or not should_export_block_name(block.getName()):
+            continue
+        start = address_offset(block.getStart())
+        end = address_offset(block.getEnd()) + 1
+        for offset in range(start, end - 5):
+            if offset in known_entries or function_manager.getFunctionContaining(to_address(program, offset)) is not None:
+                continue
+            opcodes = read_memory_bytes(program, offset, 6)
+            if opcodes[:2] != [0xFF, 0x25]:
+                continue
+            pointer_offset = int.from_bytes(bytes(opcodes[2:6]), 'little', signed=pointer_size == 8)
+            pointer_offset = offset + 6 + pointer_offset if pointer_size == 8 else pointer_offset
+            try:
+                pointer_address = to_address(program, pointer_offset)
+            except Exception:
+                continue
+            symbol = symbol_table.getPrimarySymbol(pointer_address)
+            if symbol is None or not symbol.getName(True).startswith('__imp_'):
+                continue
+            external_function = get_external_function_from_pointer(program, pointer_address)
+            if external_function is None:
+                continue
+            records.append(
+                {
+                    'address': offset,
+                    'name': external_function.getName(),
+                    'callers': get_callers_for_address(program, offset),
+                    'callees': [],
+                    'code': build_thunk_source(external_function, symbol.getName(True)),
+                }
+            )
+            known_entries.add(offset)
+    return records
 
 
 def export_decompiled_functions(flat_api, program, export_dir: Path, summary: ExportSummary) -> None:
@@ -193,22 +276,25 @@ def export_decompiled_functions(flat_api, program, export_dir: Path, summary: Ex
     function_index: list[dict[str, object]] = []
     addr_to_info: dict[int, dict[str, object]] = {}
     name_cache: dict[int, str] = {}
+    known_entries: set[int] = set()
 
     for function in iter_java_iterator(program.getListing().getFunctions(True)):
         summary.total_functions += 1
         func_ea = function_entry_offset(function)
         func_name = function.getName()
         name_cache[func_ea] = func_name
+        known_entries.add(func_ea)
         if function.getBody().isEmpty():
             skipped_funcs.append((func_ea, func_name, 'not a valid function'))
             summary.skipped_functions += 1
             continue
-        if is_library_like_function(function):
-            skipped_funcs.append((func_ea, func_name, 'library function'))
-            summary.skipped_functions += 1
-            continue
         try:
-            dec_str = decompile_function(flat_api, function).rstrip()
+            thunked_external = get_thunked_external_function(function)
+            thunk_symbol = get_import_symbol_name(program, function.getEntryPoint())
+            dec_str = (
+                build_thunk_source(thunked_external, thunk_symbol or thunked_external.getName())
+                if thunked_external is not None else decompile_function(flat_api, function).rstrip()
+            )
             if not dec_str:
                 failed_funcs.append((func_ea, func_name, 'empty decompilation result'))
                 summary.failed_functions += 1
@@ -216,20 +302,7 @@ def export_decompiled_functions(flat_api, program, export_dir: Path, summary: Ex
             callers = get_callers(function)
             callees = get_callees(function)
             output_filename = f'{func_ea:X}.c'
-            write_text(
-                decompile_dir / output_filename,
-                '\n'.join([
-                    '/*',
-                    f' * func-name: {func_name}',
-                    f' * func-address: {hex(func_ea)}',
-                    f' * callers: {format_address_list(callers)}',
-                    f' * callees: {format_address_list(callees)}',
-                    ' */',
-                    '',
-                    dec_str,
-                    '',
-                ]),
-            )
+            write_function_output(decompile_dir / output_filename, func_name, func_ea, callers, callees, dec_str)
             info = {
                 'address': func_ea,
                 'name': func_name,
@@ -246,25 +319,33 @@ def export_decompiled_functions(flat_api, program, export_dir: Path, summary: Ex
             failed_funcs.append((func_ea, func_name, f'unexpected error: {exc}'))
             summary.failed_functions += 1
 
-    if failed_funcs:
-        lines = [
-            f'# Failed to decompile {len(failed_funcs)} functions',
-            '# Format: address | function_name | reason',
-            '#' + '=' * 80,
-            '',
-        ]
-        lines.extend(f'{hex(addr)} | {name} | {reason}' for addr, name, reason in failed_funcs)
-        write_text(export_dir / 'decompile_failed.txt', '\n'.join(lines) + '\n')
-    if skipped_funcs:
-        lines = [
-            f'# Skipped {len(skipped_funcs)} functions',
-            '# Format: address | function_name | reason',
-            '#' + '=' * 80,
-            '',
-        ]
-        lines.extend(f'{hex(addr)} | {name} | {reason}' for addr, name, reason in skipped_funcs)
-        write_text(export_dir / 'decompile_skipped.txt', '\n'.join(lines) + '\n')
+    for thunk_info in collect_missing_import_thunks(program, known_entries):
+        output_filename = f'{int(thunk_info["address"]):X}.c'
+        write_function_output(
+            decompile_dir / output_filename,
+            str(thunk_info['name']),
+            int(thunk_info['address']),
+            list(thunk_info['callers']),
+            [],
+            str(thunk_info['code']),
+        )
+        info = {
+            'address': int(thunk_info['address']),
+            'name': str(thunk_info['name']),
+            'filename': output_filename,
+            'callers': list(thunk_info['callers']),
+            'callees': [],
+        }
+        function_index.append(info)
+        addr_to_info[int(thunk_info['address'])] = info
+        name_cache[int(thunk_info['address'])] = str(thunk_info['name'])
+        summary.total_functions += 1
+        summary.exported_functions += 1
+
+    write_issue_report(export_dir / 'decompile_failed.txt', f'# Failed to decompile {len(failed_funcs)} functions', failed_funcs)
+    write_issue_report(export_dir / 'decompile_skipped.txt', f'# Skipped {len(skipped_funcs)} functions', skipped_funcs)
     if function_index:
+        function_index.sort(key=lambda item: int(item['address']))
         lines = [
             '# Function Index',
             f'# Total exported functions: {len(function_index)}',
@@ -313,7 +394,7 @@ def export_decompiled_functions(flat_api, program, export_dir: Path, summary: Ex
     print('[*] Decompilation Summary:')
     print(f'    Total functions: {summary.total_functions}')
     print(f'    Exported: {summary.exported_functions}')
-    print(f'    Skipped: {summary.skipped_functions} (library/invalid functions)')
+    print(f'    Skipped: {summary.skipped_functions}')
     print(f'    Failed: {summary.failed_functions}')
 
 
